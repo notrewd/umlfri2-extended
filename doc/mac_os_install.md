@@ -51,7 +51,7 @@ some others. You can install it using pip.
 
 Just start following command inside the UML .FRI working directory:
 
-    pip3 install -r doc/dependencies.pip
+    pip3 install -r requirements.txt
 
 Download the icon pack
 ----------------------
