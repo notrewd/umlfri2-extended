@@ -1,6 +1,6 @@
 ----------------------------------------------------------------
 
-If there’s an error on macOS, use:
+If there’s an error on macOS, open the source directory in terminal, and use:
 
 find . -name ".DS_Store" -delete
 
