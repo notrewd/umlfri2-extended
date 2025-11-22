@@ -20,6 +20,8 @@ class AddOnListLoader:
     
     def load_all(self):
         for dir in self.__storage.list():
+            if dir.startswith('.'):
+                continue
             with self.__storage.create_substorage(dir) as addon_storage:
                 addon = self.__load(addon_storage)
                 if addon is not None:

@@ -50,9 +50,12 @@ class OnlineAddOnManager:
                 zip_data = urlopen(self.__ADDON_LIST_DOWNLOAD).read()
                 
                 with ZipStorage.read_from_memory(zip_data) as source_zipball:
-                    files = source_zipball.list()
+                    files = (f for f in source_zipball.list() if not f.startswith('.'))
                     
-                    source_storage = source_zipball.create_substorage(next(files))
+                    try:
+                        source_storage = source_zipball.create_substorage(next(files))
+                    except StopIteration:
+                        return
                     
                     if not os.path.exists(ONLINE_ADDONS):
                         os.makedirs(ONLINE_ADDONS)
