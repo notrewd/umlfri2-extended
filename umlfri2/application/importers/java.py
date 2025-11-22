@@ -24,6 +24,7 @@ DEFAULT_PACKAGE_ELEMENT = "package"
 GENERALISATION_CONNECTION = "generalisation"
 IMPLEMENTATION_CONNECTION = "implementation"
 ASSOCIATION_CONNECTION = "association"
+COMPOSITION_CONNECTION = "composition"
 
 VISIBILITY_MAP = {
     "public": "+",
@@ -75,6 +76,8 @@ class JavaField:
     name: str
     type_descriptor: Optional[TypeDescriptor]
     modifiers: Set[str]
+    is_instantiated: bool = False
+    is_assigned_externally: bool = False
 
     @property
     def visibility(self) -> str:
@@ -302,8 +305,51 @@ class JavaSourceParser:
         for field in getattr(type_decl, "fields", []):
             descriptor = self._convert_reference(field.type)
             for declarator in field.declarators:
-                result.append(JavaField(name=declarator.name, type_descriptor=descriptor, modifiers=set(field.modifiers or [])))
+                is_instantiated = False
+                if getattr(declarator, "initializer", None):
+                    if isinstance(declarator.initializer, javalang.tree.ClassCreator):
+                        is_instantiated = True
+                result.append(JavaField(name=declarator.name, type_descriptor=descriptor, modifiers=set(field.modifiers or []), is_instantiated=is_instantiated))
+        
+        self._analyze_lifecycle(type_decl, result)
         return result
+
+    def _analyze_lifecycle(self, type_decl: javalang.tree.TypeDeclaration, fields: List[JavaField]):
+        field_map = {f.name: f for f in fields}
+        for constructor in getattr(type_decl, "constructors", []):
+            self._analyze_code_block(constructor, field_map, is_constructor=True)
+        for method in getattr(type_decl, "methods", []):
+            self._analyze_code_block(method, field_map, is_constructor=False)
+
+    def _analyze_code_block(self, method_node, field_map, is_constructor):
+        if not method_node.body:
+            return
+        for _, node in method_node.filter(javalang.tree.Assignment):
+            target_name = self._get_assignment_target_name(node.expressionl)
+            if not target_name or target_name not in field_map:
+                continue
+            field = field_map[target_name]
+            if isinstance(node.value, javalang.tree.ClassCreator):
+                if is_constructor:
+                    field.is_instantiated = True
+            elif self._is_parameter_reference(node.value, method_node.parameters):
+                if is_constructor or "public" in (method_node.modifiers or []):
+                    field.is_assigned_externally = True
+
+    def _get_assignment_target_name(self, expression) -> Optional[str]:
+        if isinstance(expression, javalang.tree.MemberReference):
+            return expression.member
+        if isinstance(expression, javalang.tree.This):
+            if expression.selectors and isinstance(expression.selectors[0], javalang.tree.MemberReference):
+                return expression.selectors[0].member
+        return None
+
+    def _is_parameter_reference(self, expression, parameters) -> bool:
+        if isinstance(expression, javalang.tree.MemberReference):
+            for param in parameters:
+                if param.name == expression.member:
+                    return True
+        return False
 
     def _convert_methods(self, type_decl: javalang.tree.TypeDeclaration) -> List[JavaMethod]:
         result: List[JavaMethod] = []
@@ -405,6 +451,7 @@ class JavaModelBuilder:
         self._generalisation_type = self._metamodel.get_connection_type(GENERALISATION_CONNECTION)
         self._implementation_type = self._metamodel.get_connection_type(IMPLEMENTATION_CONNECTION)
         self._association_type = self._metamodel.get_connection_type(ASSOCIATION_CONNECTION)
+        self._composition_type = self._metamodel.get_connection_type(COMPOSITION_CONNECTION)
         self._packages: Dict[Tuple[str, ...], ElementObject] = {}
         self._class_elements: Dict[str, ElementObject] = {}
         self._class_visuals: Dict[str, object] = {}
@@ -730,10 +777,20 @@ class JavaModelBuilder:
             if descriptor is None:
                 continue
             association_targets = self._resolve_field_targets(descriptor, resolver, model)
+
+            connection_type = self._association_type
+            is_composition = False
+            if field.is_instantiated and not field.is_assigned_externally and not field.is_static:
+                connection_type = self._composition_type
+                is_composition = True
+
             for target_name in association_targets:
                 target = self._class_elements.get(target_name)
                 if target:
-                    self._ensure_connection(source, target, self._association_type, diagram)
+                    if is_composition:
+                        self._ensure_connection(target, source, connection_type, diagram)
+                    else:
+                        self._ensure_connection(source, target, connection_type, diagram)
 
     def _resolve_field_targets(self, descriptor: TypeDescriptor, resolver: JavaTypeResolver, context: JavaTypeModel) -> Set[str]:
         targets: Set[str] = set()
