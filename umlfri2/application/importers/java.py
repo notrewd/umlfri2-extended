@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
@@ -446,8 +446,11 @@ class JavaTypeResolver:
 class JavaModelBuilder:
     BASE_ELEMENT_WIDTH = 240
     BASE_ELEMENT_HEIGHT = 140
-    ELEMENT_SPACING_X = 60
-    ELEMENT_SPACING_Y = 60
+    ELEMENT_SPACING_X = 80
+    ELEMENT_SPACING_Y = 100
+    LAYER_MARGIN = 60
+    MIN_NODE_SEPARATION = 40
+
     def __init__(self, project: Project, ruler, view: JavaImportView = JavaImportView.INTERNAL):
         self._project = project
         self._ruler = ruler
@@ -599,177 +602,299 @@ class JavaModelBuilder:
         if not self._class_visuals:
             return
 
-        # 1. Build Graph and Calculate Ranks (Inheritance only for Y-axis)
-        hierarchy = defaultdict(list)
+        # Pre-compute node sizes for all real nodes
+        node_sizes: Dict[str, Tuple[int, int]] = {}
+        for name in types.keys():
+            if name in self._class_visuals:
+                visual = self._class_visuals[name]
+                minimal = visual.get_minimal_size(self._ruler)
+                width = max(self.BASE_ELEMENT_WIDTH, minimal.width)
+                height = max(self.BASE_ELEMENT_HEIGHT, minimal.height)
+                node_sizes[name] = (width, height)
+
+        # 1. Build directed edges for hierarchy (parent -> child)
+        hierarchy_edges: List[Tuple[str, str]] = []  # (parent, child)
         all_nodes = set(types.keys())
         children = set()
 
-        # Edges for layout (u -> v means u influences v's position)
-        # We track neighbors for barycenter calculation
-        neighbors = defaultdict(set)
-        
-        # Collect inheritance edges
         for name, model in types.items():
-            parents = []
             for base in model.extends:
                 resolved = resolver.resolve(base, model)
                 if resolved and resolved in types:
-                    parents.append(resolved)
+                    hierarchy_edges.append((resolved, name))
+                    children.add(name)
             for iface in model.implements:
                 resolved = resolver.resolve(iface, model)
                 if resolved and resolved in types:
-                    parents.append(resolved)
-            
-            for parent in parents:
-                hierarchy[parent].append(name)
-                children.add(name)
-                neighbors[name].add(parent)
-                neighbors[parent].add(name)
+                    hierarchy_edges.append((resolved, name))
+                    children.add(name)
 
-        # Collect association edges for crossing minimization (but not for rank)
+        # Collect association edges (for crossing minimization only)
+        association_edges: List[Tuple[str, str]] = []
         for name, model in types.items():
             targets = self._resolve_field_targets_for_model(model, resolver)
             for target in targets:
                 if target in types and target != name:
-                    neighbors[name].add(target)
-                    neighbors[target].add(name)
+                    association_edges.append((name, target))
 
-        # Assign Ranks
+        # 2. Assign ranks using longest-path layering for better hierarchy visualization
         roots = list(all_nodes - children)
-        ranks = {}
-        
-        def assign_rank(node, rank):
-            if node in ranks and ranks[node] >= rank:
-                return
-            ranks[node] = rank
-            for child in hierarchy[node]:
-                assign_rank(child, rank + 1)
+        if not roots:
+            # Handle cycles: pick node with most outgoing hierarchy edges
+            out_degree = defaultdict(int)
+            for parent, _ in hierarchy_edges:
+                out_degree[parent] += 1
+            roots = [max(all_nodes, key=lambda n: out_degree.get(n, 0))]
 
-        for root in roots:
-            assign_rank(root, 0)
+        ranks: Dict[str, int] = {}
+        hierarchy_children = defaultdict(list)
+        for parent, child in hierarchy_edges:
+            hierarchy_children[parent].append(child)
+
+        def assign_rank_bfs(start_nodes: List[str]):
+            queue = deque()
+            for node in start_nodes:
+                if node not in ranks:
+                    ranks[node] = 0
+                    queue.append(node)
             
-        # Handle disconnected nodes or cycles
+            while queue:
+                current = queue.popleft()
+                current_rank = ranks[current]
+                for child in hierarchy_children[current]:
+                    new_rank = current_rank + 1
+                    if child not in ranks or ranks[child] < new_rank:
+                        ranks[child] = new_rank
+                        queue.append(child)
+
+        assign_rank_bfs(roots)
+        
+        # Handle disconnected nodes
         for node in all_nodes:
             if node not in ranks:
-                assign_rank(node, 0)
+                ranks[node] = 0
 
-        # 2. Insert Dummy Nodes for long edges
-        # We need to consider all edges that will be drawn
-        visual_edges = set()
-        
-        # Inheritance edges
-        for parent, kids in hierarchy.items():
-            for kid in kids:
-                visual_edges.add(tuple(sorted((parent, kid))))
-        
-        # Association edges
-        for name, model in types.items():
-            targets = self._resolve_field_targets_for_model(model, resolver)
-            for target in targets:
-                if target in types and target != name:
-                    visual_edges.add(tuple(sorted((name, target))))
+        max_rank = max(ranks.values()) if ranks else 0
 
-        layer_nodes = defaultdict(list)
+        # 3. Group nodes by rank
+        layer_nodes: Dict[int, List[str]] = defaultdict(list)
         for node, rank in ranks.items():
             layer_nodes[rank].append(node)
 
-        # Add dummy nodes
-        dummy_nodes = {} # id -> rank
-        dummy_edges = defaultdict(list) # node -> [neighbors] (including dummies)
+        # 4. Build adjacency for ordering (including association edges)
+        ordering_neighbors: Dict[str, Set[str]] = defaultdict(set)
         
-        # Re-build adjacency for ordering including dummies
-        ordering_neighbors = defaultdict(set)
+        # Add hierarchy edges
+        for parent, child in hierarchy_edges:
+            ordering_neighbors[parent].add(child)
+            ordering_neighbors[child].add(parent)
         
-        for u, v in visual_edges:
-            rank_u, rank_v = ranks[u], ranks[v]
+        # Add association edges
+        for source, target in association_edges:
+            ordering_neighbors[source].add(target)
+            ordering_neighbors[target].add(source)
+
+        # 5. Insert dummy nodes for edges spanning multiple ranks
+        all_edges = set(hierarchy_edges) | set(association_edges)
+        dummy_nodes: Dict[str, int] = {}  # dummy_id -> rank
+        dummy_counter = 0
+
+        for u, v in all_edges:
+            rank_u, rank_v = ranks.get(u, 0), ranks.get(v, 0)
             if rank_u > rank_v:
                 u, v = v, u
                 rank_u, rank_v = rank_v, rank_u
             
             if rank_v - rank_u > 1:
-                # Insert dummies
                 prev = u
                 for r in range(rank_u + 1, rank_v):
-                    dummy_id = f"__dummy_{u}_{v}_{r}"
+                    dummy_id = f"__dummy_{dummy_counter}"
+                    dummy_counter += 1
                     dummy_nodes[dummy_id] = r
                     layer_nodes[r].append(dummy_id)
-                    
                     ordering_neighbors[prev].add(dummy_id)
                     ordering_neighbors[dummy_id].add(prev)
                     prev = dummy_id
-                
                 ordering_neighbors[prev].add(v)
                 ordering_neighbors[v].add(prev)
-            else:
-                ordering_neighbors[u].add(v)
-                ordering_neighbors[v].add(u)
 
-        # 3. Order Nodes in Layers (Crossing Minimization)
-        max_rank = max(ranks.values()) if ranks else 0
+        # 6. Initial ordering: sort by name for determinism, prioritize nodes with more connections
+        def initial_priority(node: str) -> Tuple[int, str]:
+            return (-len(ordering_neighbors.get(node, set())), node)
         
-        # Initial sort by name to be deterministic
         for r in layer_nodes:
-            layer_nodes[r].sort()
+            layer_nodes[r].sort(key=initial_priority)
 
-        def get_barycenter(node, neighbor_layer):
-            relevant_neighbors = [n for n in ordering_neighbors[node] 
-                                if (n in ranks and ranks[n] == neighbor_layer) or 
-                                   (n in dummy_nodes and dummy_nodes[n] == neighbor_layer)]
-            if not relevant_neighbors:
-                return 0
-            
-            positions = []
-            for n in relevant_neighbors:
-                if n in layer_nodes[neighbor_layer]:
-                    positions.append(layer_nodes[neighbor_layer].index(n))
-            
-            return sum(positions) / len(positions) if positions else 0
+        # 7. Crossing minimization using weighted barycenter with position-aware calculation
+        def get_node_rank(node: str) -> int:
+            if node in ranks:
+                return ranks[node]
+            return dummy_nodes.get(node, 0)
 
-        # Iterative refinement
-        iterations = 10
-        for _ in range(iterations):
-            # Down sweep
-            for r in range(1, max_rank + 1):
-                layer_nodes[r].sort(key=lambda n: get_barycenter(n, r - 1))
-            
-            # Up sweep
-            for r in range(max_rank - 1, -1, -1):
-                layer_nodes[r].sort(key=lambda n: get_barycenter(n, r + 1))
+        # Track horizontal positions for barycenter calculation
+        node_positions: Dict[str, float] = {}
+        
+        def update_positions(layer: int):
+            nodes = layer_nodes[layer]
+            for idx, node in enumerate(nodes):
+                node_positions[node] = idx
 
-        # 4. Assign Coordinates
-        current_y = 40
+        # Initialize positions
+        for r in range(max_rank + 1):
+            update_positions(r)
+
+        def get_weighted_barycenter(node: str, neighbor_layer: int) -> float:
+            relevant = [n for n in ordering_neighbors.get(node, set()) 
+                       if get_node_rank(n) == neighbor_layer]
+            if not relevant:
+                return node_positions.get(node, 0)
+            
+            total_weight = 0.0
+            weighted_sum = 0.0
+            for n in relevant:
+                pos = node_positions.get(n, 0)
+                # Weight hierarchy edges more heavily than associations
+                is_hierarchy = any((node == p and n == c) or (n == p and node == c) 
+                                  for p, c in hierarchy_edges)
+                weight = 2.0 if is_hierarchy else 1.0
+                weighted_sum += pos * weight
+                total_weight += weight
+            
+            return weighted_sum / total_weight if total_weight > 0 else 0
+
+        # Iterative barycenter refinement with more iterations for better results
+        for iteration in range(24):
+            changed = False
+            
+            # Alternate between down and up sweeps
+            if iteration % 2 == 0:
+                # Down sweep
+                for r in range(1, max_rank + 1):
+                    old_order = layer_nodes[r][:]
+                    layer_nodes[r].sort(key=lambda n: get_weighted_barycenter(n, r - 1))
+                    if layer_nodes[r] != old_order:
+                        changed = True
+                    update_positions(r)
+            else:
+                # Up sweep
+                for r in range(max_rank - 1, -1, -1):
+                    old_order = layer_nodes[r][:]
+                    layer_nodes[r].sort(key=lambda n: get_weighted_barycenter(n, r + 1))
+                    if layer_nodes[r] != old_order:
+                        changed = True
+                    update_positions(r)
+            
+            if not changed and iteration > 4:
+                break
+
+        # 8. Calculate actual coordinates with proper spacing
+        # First pass: calculate layer widths and heights
+        layer_heights: Dict[int, int] = {}
+        layer_widths: Dict[int, int] = {}
         
         for rank in range(max_rank + 1):
             nodes = layer_nodes[rank]
-            row_height = 0
+            max_height = self.BASE_ELEMENT_HEIGHT
+            total_width = 0
+            real_node_count = 0
             
-            # Calculate row height first
             for node in nodes:
-                if node in self._class_visuals:
-                    visual = self._class_visuals[node]
-                    minimal = visual.get_minimal_size(self._ruler)
-                    row_height = max(row_height, max(self.BASE_ELEMENT_HEIGHT, minimal.height))
-            
-            if row_height == 0:
-                row_height = self.BASE_ELEMENT_HEIGHT # Fallback for rows with only dummies
-
-            current_x = 40
-            for node in nodes:
-                if node in self._class_visuals:
-                    visual = self._class_visuals[node]
-                    minimal = visual.get_minimal_size(self._ruler)
-                    width = max(self.BASE_ELEMENT_WIDTH, minimal.width)
-                    height = max(self.BASE_ELEMENT_HEIGHT, minimal.height)
-                    
-                    visual.move(self._ruler, Point(current_x, current_y))
-                    visual.resize(self._ruler, Size(width, height))
-                    
-                    current_x += width + self.ELEMENT_SPACING_X
+                if node in node_sizes:
+                    w, h = node_sizes[node]
+                    max_height = max(max_height, h)
+                    total_width += w
+                    real_node_count += 1
                 else:
-                    # Dummy node spacing
-                    current_x += self.ELEMENT_SPACING_X # Just reserve some space for the line
+                    # Dummy node - minimal width for edge routing
+                    total_width += self.MIN_NODE_SEPARATION
             
-            current_y += row_height + self.ELEMENT_SPACING_Y
+            # Add spacing between nodes
+            if real_node_count > 0:
+                total_width += (len(nodes) - 1) * self.ELEMENT_SPACING_X
+            
+            layer_heights[rank] = max_height
+            layer_widths[rank] = total_width
+
+        # Find the widest layer to center others
+        max_layer_width = max(layer_widths.values()) if layer_widths else 0
+
+        # 9. Position nodes with center alignment per layer
+        node_coords: Dict[str, Tuple[int, int, int, int]] = {}  # node -> (x, y, w, h)
+        current_y = self.LAYER_MARGIN
+
+        for rank in range(max_rank + 1):
+            nodes = layer_nodes[rank]
+            layer_height = layer_heights[rank]
+            layer_width = layer_widths[rank]
+            
+            # Center this layer horizontally
+            start_x = self.LAYER_MARGIN + (max_layer_width - layer_width) // 2
+            current_x = start_x
+
+            for node in nodes:
+                if node in node_sizes:
+                    w, h = node_sizes[node]
+                    # Vertically center within the layer
+                    y_offset = (layer_height - h) // 2
+                    node_coords[node] = (current_x, current_y + y_offset, w, h)
+                    current_x += w + self.ELEMENT_SPACING_X
+                else:
+                    # Dummy node - track position for edge routing calculation
+                    node_coords[node] = (current_x + self.MIN_NODE_SEPARATION // 2, 
+                                        current_y + layer_height // 2, 
+                                        self.MIN_NODE_SEPARATION, 0)
+                    current_x += self.MIN_NODE_SEPARATION + self.ELEMENT_SPACING_X // 2
+
+            current_y += layer_height + self.ELEMENT_SPACING_Y
+
+        # 10. Apply coordinates to visual elements
+        for name, (x, y, w, h) in node_coords.items():
+            if name in self._class_visuals:
+                visual = self._class_visuals[name]
+                visual.move(self._ruler, Point(x, y))
+                visual.resize(self._ruler, Size(w, h))
+
+        # 11. Post-processing: Check for and fix any remaining overlaps
+        self._fix_overlaps(node_coords, max_rank, layer_nodes, node_sizes)
+
+    def _fix_overlaps(self, node_coords: Dict[str, Tuple[int, int, int, int]], 
+                      max_rank: int, layer_nodes: Dict[int, List[str]],
+                      node_sizes: Dict[str, Tuple[int, int]]):
+        """Post-process to fix any remaining node overlaps within layers."""
+        
+        for rank in range(max_rank + 1):
+            nodes = layer_nodes[rank]
+            real_nodes = [n for n in nodes if n in node_sizes]
+            
+            if len(real_nodes) < 2:
+                continue
+            
+            # Sort by current x position
+            real_nodes.sort(key=lambda n: node_coords[n][0])
+            
+            # Check and fix overlaps
+            for i in range(1, len(real_nodes)):
+                prev_node = real_nodes[i - 1]
+                curr_node = real_nodes[i]
+                
+                prev_x, prev_y, prev_w, prev_h = node_coords[prev_node]
+                curr_x, curr_y, curr_w, curr_h = node_coords[curr_node]
+                
+                min_x = prev_x + prev_w + self.ELEMENT_SPACING_X
+                
+                if curr_x < min_x:
+                    # Need to shift this node and all following nodes
+                    shift = min_x - curr_x
+                    for j in range(i, len(real_nodes)):
+                        node = real_nodes[j]
+                        old_x, old_y, old_w, old_h = node_coords[node]
+                        node_coords[node] = (old_x + shift, old_y, old_w, old_h)
+                        
+                        # Update visual
+                        if node in self._class_visuals:
+                            visual = self._class_visuals[node]
+                            visual.move(self._ruler, Point(old_x + shift, old_y))
+                            visual.resize(self._ruler, Size(old_w, old_h))
 
     def _resolve_field_targets_for_model(self, model: JavaTypeModel, resolver: JavaTypeResolver) -> Set[str]:
         targets: Set[str] = set()
