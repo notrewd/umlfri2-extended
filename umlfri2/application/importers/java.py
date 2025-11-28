@@ -4,6 +4,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import javalang
@@ -35,6 +36,12 @@ VISIBILITY_MAP = {
 
 class JavaImportError(Exception):
     """Raised when the Java importer cannot complete the requested action."""
+
+
+class JavaImportView(Enum):
+    """Specifies which members to include when importing Java sources."""
+    INTERNAL = "internal"  # All members (private, protected, public)
+    EXTERNAL = "external"  # Only public members, constructors shown as "new(...)", generalization only
 
 
 @dataclass
@@ -441,9 +448,10 @@ class JavaModelBuilder:
     BASE_ELEMENT_HEIGHT = 140
     ELEMENT_SPACING_X = 60
     ELEMENT_SPACING_Y = 60
-    def __init__(self, project: Project, ruler):
+    def __init__(self, project: Project, ruler, view: JavaImportView = JavaImportView.INTERNAL):
         self._project = project
         self._ruler = ruler
+        self._view = view
         self._metamodel = project.metamodel
         self._package_type = self._metamodel.get_element_type(DEFAULT_PACKAGE_ELEMENT)
         self._class_type = self._metamodel.get_element_type(DEFAULT_CLASS_ELEMENT)
@@ -533,7 +541,7 @@ class JavaModelBuilder:
                 row.set_value("visibility", VISIBILITY_MAP.get("public", "+"))
         else:
             self._populate_attributes(mutable, model.fields)
-        self._populate_operations(mutable, model.methods)
+        self._populate_operations(mutable, model.methods, model.name, is_interface=(model.kind == "interface"))
         element.apply_ufl_patch(mutable.make_patch())
         return element
 
@@ -547,21 +555,40 @@ class JavaModelBuilder:
     def _populate_attributes(self, mutable, fields: List[JavaField]):
         attributes = mutable.get_value("attributes")
         for field in fields:
+            # In external view, only include public attributes
+            if self._view == JavaImportView.EXTERNAL and field.visibility != "+":
+                continue
             row = attributes.append()
             row.set_value("name", field.name)
             row.set_value("type", field.type_descriptor.display() if field.type_descriptor else "")
             row.set_value("visibility", field.visibility)
             row.set_value("static", field.is_static)
 
-    def _populate_operations(self, mutable, methods: List[JavaMethod]):
+    def _populate_operations(self, mutable, methods: List[JavaMethod], class_name: str = "", is_interface: bool = False):
         operations = mutable.get_value("operations")
         for method in methods:
+            # In external view, only include public methods and constructors
+            # Exception: always include methods for interfaces
+            if self._view == JavaImportView.EXTERNAL:
+                if not is_interface and not method.is_constructor and method.visibility != "+":
+                    continue
+            
             row = operations.append()
-            row.set_value("name", method.name)
-            row.set_value("rtype", method.return_type.display() if method.return_type else "")
-            row.set_value("visibility", method.visibility)
-            row.set_value("static", method.is_static)
-            row.set_value("abstract", method.is_abstract)
+            
+            # In external view, constructors are shown as "new(...)" and marked static with return type of class
+            if self._view == JavaImportView.EXTERNAL and method.is_constructor:
+                row.set_value("name", "new")
+                row.set_value("rtype", class_name)
+                row.set_value("visibility", method.visibility)
+                row.set_value("static", True)
+                row.set_value("abstract", False)
+            else:
+                row.set_value("name", method.name)
+                row.set_value("rtype", method.return_type.display() if method.return_type else "")
+                row.set_value("visibility", method.visibility)
+                row.set_value("static", method.is_static)
+                row.set_value("abstract", method.is_abstract)
+            
             params = row.get_value("parameters")
             for param in method.parameters:
                 prow = params.append()
@@ -762,13 +789,16 @@ class JavaModelBuilder:
                 target = self._class_elements.get(target_name)
                 if target:
                     created += self._ensure_connection(source, target, self._generalisation_type, diagram)
+            # Implementation arrows are shown in both views
             for iface in model.implements:
                 target_name = resolver.resolve(iface, model)
                 target = self._class_elements.get(target_name)
                 if target:
                     connection_type = self._implementation_type if model.kind == "class" else self._generalisation_type
                     created += self._ensure_connection(source, target, connection_type, diagram)
-            self._create_associations(model, resolver, source, diagram)
+            # In external view, skip associations
+            if self._view == JavaImportView.INTERNAL:
+                self._create_associations(model, resolver, source, diagram)
         return created
 
     def _create_associations(self, model: JavaTypeModel, resolver: JavaTypeResolver, source, diagram):
@@ -825,7 +855,8 @@ class JavaImportController:
         self._template_id = template_id
         self._parser = JavaSourceParser()
 
-    def import_directory(self, path: str, project_name: Optional[str] = None) -> JavaImportReport:
+    def import_directory(self, path: str, project_name: Optional[str] = None, 
+                         view: JavaImportView = JavaImportView.INTERNAL) -> JavaImportReport:
         normalized = os.path.abspath(path)
         if not os.path.exists(normalized):
             raise JavaImportError(f"Path '{path}' does not exist")
@@ -850,7 +881,7 @@ class JavaImportController:
         self._application.new_project(template, new_solution=True, project_name=name)
         project = next(self._application.solution.children)
 
-        builder = JavaModelBuilder(project, self._application.ruler)
+        builder = JavaModelBuilder(project, self._application.ruler, view=view)
         summary = builder.build(parse_result.types)
         if summary.primary_diagram is not None:
             self._application.tabs.select_tab(summary.primary_diagram)

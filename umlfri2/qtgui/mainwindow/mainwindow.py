@@ -6,7 +6,7 @@ from PyQt5.QtGui import QIcon, QDesktopServices
 from PyQt5.QtWidgets import QMainWindow, QDockWidget, QMessageBox, QFileDialog, QApplication, QInputDialog
 
 from umlfri2.application import Application
-from umlfri2.application.importers import JavaImportController, JavaImportError
+from umlfri2.application.importers import JavaImportController, JavaImportError, JavaImportView
 from umlfri2.application.addon.local import AddOnState
 from umlfri2.application.events.addon import AddOnStateChangedEvent
 from umlfri2.application.events.application import LanguageChangedEvent, ChangeStatusChangedEvent, \
@@ -259,6 +259,21 @@ class UmlFriMainWindow(QMainWindow):
         if not directory:
             return
 
+        # Ask user to select internal or external view
+        view_options = [_("Internal (all members)"), _("External (public only)")]
+        view_choice, ok = QInputDialog.getItem(
+            self,
+            _("Import View"),
+            _("Select import view:"),
+            view_options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        
+        import_view = JavaImportView.EXTERNAL if view_choice == view_options[1] else JavaImportView.INTERNAL
+
         suggested_name = os.path.basename(directory) or _("Imported Java Project")
         name, ok = QInputDialog.getText(
             self,
@@ -274,7 +289,7 @@ class UmlFriMainWindow(QMainWindow):
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             cursor_applied = True
-            report = self.__java_importer.import_directory(directory, project_name=project_name)
+            report = self.__java_importer.import_directory(directory, project_name=project_name, view=import_view)
         except JavaImportError as exc:
             QMessageBox.critical(self, _("Java Import Failed"), str(exc))
             return

@@ -1,3 +1,3 @@
-from .java import JavaImportController, JavaImportError
+from .java import JavaImportController, JavaImportError, JavaImportView
 
-__all__ = ["JavaImportController", "JavaImportError"]
+__all__ = ["JavaImportController", "JavaImportError", "JavaImportView"]
