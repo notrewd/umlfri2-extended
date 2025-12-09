@@ -27,12 +27,12 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller umlfri2.spec
+          pyinstaller umlfri2-extended.spec
 
       - name: Upload executable to release
         uses: softprops/action-gh-release@v2.4.2
         with:
           files: |
-            dist/umlfri2.exe
+            dist/umlfri2-extended.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

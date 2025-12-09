@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='umlfri2',
+    name='umlfri2-extended',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -38,7 +38,7 @@ exe = EXE(
 )
 app = BUNDLE(
     exe,
-    name='umlfri2.app',
+    name='umlfri2-extended.app',
     icon=None,
     bundle_identifier=None,
 )
