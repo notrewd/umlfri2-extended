@@ -1,22 +1,2 @@
-# Automatic Java Import
-
-UML .FRI now understands how to build a full class diagram directly from Java
-source files:
-
-1. Start the desktop application and open the **File** menu.
-2. Choose **Import Java Sources**.
-3. Select either a folder tree or a single `.java` file that should be
-   analysed.
-4. Enter a project name when prompted. A new solution is created and populated
-   with the imported classes, inheritance links, implemented interfaces and
-   basic associations derived from fields.
-
-Warnings reported by the importer (for example syntax errors in individual
-files) are displayed after the import finishes so you can fix the sources and
-run the import again if necessary.
-
-# Error handling on macOS
-
-There might be a case where the application errors out due to DS_Store files.
-In this case type the following in the terminal:
-`find . -name ".DS_Store" -delete`
+# umlfri2 Extended
+An extended version of the umlfri2 software which brings various quality of life additions.
