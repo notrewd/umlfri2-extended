@@ -393,9 +393,8 @@ class BaseModelBuilder:
                     # For interfaces implementing interfaces, use generalization
                     connection_type = self._implementation_type if model.kind == "class" else self._generalisation_type
                     created += self._ensure_connection(source, target, connection_type, diagram)
-            # In INTERNAL view, also create associations based on field types
-            if self._view == ImportView.INTERNAL:
-                created += self._create_associations(model, resolver, source, diagram)
+            # Create associations based on field types
+            created += self._create_associations(model, resolver, source, diagram)
         return created
 
     def _create_associations(self, model: TypeModel, resolver: TypeResolver, source, diagram) -> int:

@@ -921,9 +921,8 @@ class JavaModelBuilder:
                 if target:
                     connection_type = self._implementation_type if model.kind == "class" else self._generalisation_type
                     created += self._ensure_connection(source, target, connection_type, diagram)
-            # In external view, skip associations
-            if self._view == JavaImportView.INTERNAL:
-                self._create_associations(model, resolver, source, diagram)
+            # Create associations based on field types
+            self._create_associations(model, resolver, source, diagram)
         return created
 
     def _create_associations(self, model: JavaTypeModel, resolver: JavaTypeResolver, source, diagram):
