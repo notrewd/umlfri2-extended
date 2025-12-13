@@ -5,5 +5,4 @@ qtconsole
 jinja2
 lxml
 pyparsing
-sentry-sdk
 javalang>=0.13.0
