@@ -250,6 +250,37 @@ class JavaImporterParserTests(unittest.TestCase):
         methods = [m for m in model.methods if (not m.is_constructor and m.name == "getReprezentacia")]
         self.assertEqual(len(methods), 1)
 
+    def test_final_fields_have_stereotype_and_inline_default(self):
+        source = textwrap.dedent(
+            """
+            public class FinalDefaults {
+                public final String NAME = \"X\";
+                public final int ANSWER = 42;
+                public int NON_FINAL = 7;
+                public final int assignedInCtor;
+                public FinalDefaults() { assignedInCtor = 123; }
+            }
+            """
+        ).strip()
+
+        with TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "FinalDefaults.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(source)
+
+            result = JavaSourceParser().parse_files([path])
+
+        model = result.types["FinalDefaults"]
+        fields = {f.name: f for f in model.fields}
+        self.assertIn("final", fields["NAME"].modifiers)
+        self.assertEqual(fields["NAME"].default_value, '"X"')
+        self.assertIn("final", fields["ANSWER"].modifiers)
+        self.assertEqual(fields["ANSWER"].default_value, "42")
+        self.assertNotIn("final", fields["NON_FINAL"].modifiers)
+        self.assertIsNone(fields["NON_FINAL"].default_value)
+        self.assertIn("final", fields["assignedInCtor"].modifiers)
+        self.assertEqual(fields["assignedInCtor"].default_value, "123")
+
 
 if __name__ == "__main__":
     unittest.main()

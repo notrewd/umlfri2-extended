@@ -91,6 +91,8 @@ class JavaField:
     modifiers: Set[str]
     is_instantiated: bool = False
     is_assigned_externally: bool = False
+    default_value: Optional[str] = None
+    ctor_default_candidates: Set[str] = field(default_factory=set, repr=False)
 
     @property
     def visibility(self) -> str:
@@ -347,6 +349,14 @@ class JavaSourceParser:
                 prefix = f"{qualifier}." if qualifier else ""
                 return f"{prefix}{member}({args})"
 
+            if isinstance(expr, javalang.tree.ClassCreator):
+                tdesc = self._convert_reference(getattr(expr, "type", None))
+                tname = tdesc.display() if tdesc is not None else ""
+                args = ", ".join(self._render_expression(a) for a in (getattr(expr, "arguments", None) or []))
+                if tname:
+                    return f"new {tname}({args})"
+                return f"new ({args})"
+
             # Fallback for any other node types.
             text = getattr(expr, "value", None)
             if isinstance(text, str) and text:
@@ -393,10 +403,26 @@ class JavaSourceParser:
             descriptor = self._convert_reference(field.type)
             for declarator in field.declarators:
                 is_instantiated = False
-                if getattr(declarator, "initializer", None):
-                    if isinstance(declarator.initializer, javalang.tree.ClassCreator):
+                default_value: Optional[str] = None
+                initializer = getattr(declarator, "initializer", None)
+                if initializer is not None:
+                    if isinstance(initializer, javalang.tree.ClassCreator):
                         is_instantiated = True
-                result.append(JavaField(name=declarator.name, type_descriptor=descriptor, modifiers=set(field.modifiers or []), is_instantiated=is_instantiated))
+                    # Only treat inline initializers of `final` fields as defaults.
+                    # Do NOT infer defaults from constructor assignments.
+                    if "final" in (field.modifiers or []):
+                        rendered = self._render_expression(initializer)
+                        if rendered:
+                            default_value = rendered
+                result.append(
+                    JavaField(
+                        name=declarator.name,
+                        type_descriptor=descriptor,
+                        modifiers=set(field.modifiers or []),
+                        is_instantiated=is_instantiated,
+                        default_value=default_value,
+                    )
+                )
         
         self._analyze_lifecycle(type_decl, result)
         return result
@@ -408,6 +434,15 @@ class JavaSourceParser:
         for method in getattr(type_decl, "methods", []):
             self._analyze_code_block(method, field_map, is_constructor=False)
 
+        # Finalize defaults for final fields assigned in constructors.
+        for field_model in fields:
+            if "final" not in field_model.modifiers:
+                continue
+            if field_model.default_value is not None:
+                continue
+            if len(field_model.ctor_default_candidates) == 1:
+                field_model.default_value = next(iter(field_model.ctor_default_candidates))
+
     def _analyze_code_block(self, method_node, field_map, is_constructor):
         if not method_node.body:
             return
@@ -416,6 +451,10 @@ class JavaSourceParser:
             if not target_name or target_name not in field_map:
                 continue
             field = field_map[target_name]
+            if is_constructor and "final" in field.modifiers and field.default_value is None:
+                rendered = self._render_expression(node.value)
+                if rendered:
+                    field.ctor_default_candidates.add(rendered)
             if isinstance(node.value, javalang.tree.ClassCreator):
                 if is_constructor:
                     field.is_instantiated = True
@@ -701,6 +740,10 @@ class JavaModelBuilder:
             row.set_value("type", field.type_descriptor.display() if field.type_descriptor else "")
             row.set_value("visibility", field.visibility)
             row.set_value("static", field.is_static)
+            if "final" in field.modifiers:
+                row.set_value("stereotype", "final")
+            if field.default_value:
+                row.set_value("default", field.default_value)
 
     def _populate_operations(
         self,
