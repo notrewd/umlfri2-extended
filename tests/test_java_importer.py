@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from umlfri2.application.importers.java import (
     ImportContext,
     JavaSourceParser,
+    JavaEnumConstant,
     JavaTypeModel,
     JavaTypeResolver,
     TypeDescriptor,
@@ -166,6 +167,88 @@ class JavaImporterParserTests(unittest.TestCase):
         self.assertEqual(len(constructors), 1)
         self.assertEqual(constructors[0].name, "PackagePrivate")
         self.assertFalse(any(m in constructors[0].modifiers for m in ["public", "protected", "private"]))
+
+    def test_parser_extracts_enum_constants(self):
+        source = textwrap.dedent(
+            """
+            package com.example;
+            public enum Color {
+                RED,
+                GREEN,
+                BLUE;
+            }
+            """
+        ).strip()
+
+        with TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "Color.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(source)
+
+            result = JavaSourceParser().parse_files([path])
+
+        self.assertIn("com.example.Color", result.types)
+        model = result.types["com.example.Color"]
+        self.assertEqual(model.kind, "enum")
+        self.assertEqual(model.stereotype, "enumeration")
+        self.assertEqual([c.name for c in model.enum_constants], ["RED", "GREEN", "BLUE"])
+
+    def test_parser_extracts_enum_constant_arguments(self):
+        source = textwrap.dedent(
+            """
+            package com.example;
+            public enum Status {
+                OK(\"All good\"),
+                FAIL(\"Nope\");
+                private final String message;
+                Status(String message) { this.message = message; }
+            }
+            """
+        ).strip()
+
+        with TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "Status.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(source)
+
+            result = JavaSourceParser().parse_files([path])
+
+        model = result.types["com.example.Status"]
+        self.assertEqual([c.name for c in model.enum_constants], ["OK", "FAIL"])
+        self.assertEqual(model.enum_constants[0].arguments, ['"All good"'])
+        ctors = [m for m in model.methods if m.is_constructor]
+        self.assertTrue(any(c.parameters for c in ctors))
+
+    def test_enum_methods_are_not_duplicated(self):
+        source = textwrap.dedent(
+            """
+            public enum TestEnum {
+                TEST1(\"Test1\"),
+                TEST2(\"Test2\");
+
+                private String reprezentacia;
+
+                private TestEnum(String reprezentacia) {
+                    this.reprezentacia = reprezentacia;
+                }
+
+                public String getReprezentacia() {
+                    return reprezentacia;
+                }
+            }
+            """
+        ).strip()
+
+        with TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "TestEnum.java")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(source)
+
+            result = JavaSourceParser().parse_files([path])
+
+        model = result.types["TestEnum"]
+        methods = [m for m in model.methods if (not m.is_constructor and m.name == "getReprezentacia")]
+        self.assertEqual(len(methods), 1)
 
 
 if __name__ == "__main__":

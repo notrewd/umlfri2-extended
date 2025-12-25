@@ -79,6 +79,12 @@ class TypeDescriptor:
 
 
 @dataclass
+class JavaEnumConstant:
+    name: str
+    arguments: List[str] = field(default_factory=list)
+
+
+@dataclass
 class JavaField:
     name: str
     type_descriptor: Optional[TypeDescriptor]
@@ -140,7 +146,7 @@ class JavaTypeModel:
     implements: List[TypeDescriptor]
     imports: ImportContext
     source_path: str
-    enum_constants: List[str] = field(default_factory=list)
+    enum_constants: List[JavaEnumConstant] = field(default_factory=list)
 
     @property
     def full_name(self) -> str:
@@ -157,7 +163,7 @@ class JavaTypeModel:
         if self.kind == "interface":
             return "interface"
         if self.kind == "enum":
-            return "enum"
+            return "enumeration"
         return None
 
 
@@ -259,7 +265,7 @@ class JavaSourceParser:
         methods = self._convert_methods(type_decl)
         enum_constants = []
         if isinstance(type_decl, javalang.tree.EnumDeclaration):
-            enum_constants = [const.name for const in type_decl.constants or []]
+            enum_constants = self._extract_enum_constants(type_decl)
 
         return JavaTypeModel(
             name=type_decl.name,
@@ -274,6 +280,80 @@ class JavaSourceParser:
             source_path=path,
             enum_constants=enum_constants,
         )
+
+    def _extract_enum_constants(self, enum_decl: javalang.tree.EnumDeclaration) -> List[JavaEnumConstant]:
+        """Return enum constant names across javalang versions.
+
+        Some javalang versions expose constants as `EnumDeclaration.constants`, others
+        nest them under `EnumDeclaration.body.constants`.
+        """
+
+        candidates = []
+        direct_constants = getattr(enum_decl, "constants", None)
+        if direct_constants is not None:
+            candidates = direct_constants
+        else:
+            body = getattr(enum_decl, "body", None)
+            candidates = getattr(body, "constants", None) if body is not None else None
+
+        output: List[JavaEnumConstant] = []
+        for item in candidates or []:
+            name = getattr(item, "name", None)
+            if isinstance(name, str) and name:
+                raw_args = getattr(item, "arguments", None) or []
+                rendered_args: List[str] = []
+                for arg in raw_args:
+                    rendered = self._render_expression(arg)
+                    if rendered:
+                        rendered_args.append(rendered)
+                output.append(JavaEnumConstant(name=name, arguments=rendered_args))
+        return output
+
+    def _render_expression(self, expr) -> str:
+        """Best-effort expression renderer for enum constant arguments.
+
+        This is intentionally conservative: it must never raise during import.
+        """
+
+        if expr is None:
+            return ""
+
+        try:
+            if isinstance(expr, javalang.tree.Literal):
+                return str(getattr(expr, "value", ""))
+            if isinstance(expr, javalang.tree.MemberReference):
+                # e.g. SOME_CONST
+                return str(getattr(expr, "member", ""))
+            if isinstance(expr, javalang.tree.This):
+                return "this"
+            if isinstance(expr, javalang.tree.BinaryOperation):
+                left = self._render_expression(getattr(expr, "operandl", None))
+                right = self._render_expression(getattr(expr, "operandr", None))
+                op = str(getattr(expr, "operator", ""))
+                if left and right and op:
+                    return f"{left} {op} {right}"
+                return left or right
+            if isinstance(expr, javalang.tree.Cast):
+                t = getattr(expr, "type", None)
+                type_name = getattr(t, "name", None) if t is not None else None
+                inner = self._render_expression(getattr(expr, "expression", None))
+                if type_name and inner:
+                    return f"({type_name}){inner}"
+                return inner
+            if isinstance(expr, javalang.tree.MethodInvocation):
+                qualifier = getattr(expr, "qualifier", None)
+                member = getattr(expr, "member", "")
+                args = ", ".join(self._render_expression(a) for a in (getattr(expr, "arguments", None) or []))
+                prefix = f"{qualifier}." if qualifier else ""
+                return f"{prefix}{member}({args})"
+
+            # Fallback for any other node types.
+            text = getattr(expr, "value", None)
+            if isinstance(text, str) and text:
+                return text
+        except Exception:
+            return ""
+        return ""
 
     def _convert_reference(self, ref: Optional[javalang.tree.Type]) -> Optional[TypeDescriptor]:
         if ref is None:
@@ -360,7 +440,21 @@ class JavaSourceParser:
 
     def _convert_methods(self, type_decl: javalang.tree.TypeDeclaration) -> List[JavaMethod]:
         result: List[JavaMethod] = []
-        for constructor in getattr(type_decl, "constructors", []):
+
+        constructors = list(getattr(type_decl, "constructors", []) or [])
+        methods = list(getattr(type_decl, "methods", []) or [])
+
+        # Some javalang versions store enum constructors/methods in EnumDeclaration.body.declarations.
+        if isinstance(type_decl, javalang.tree.EnumDeclaration):
+            body = getattr(type_decl, "body", None)
+            declarations = list(getattr(body, "declarations", []) or []) if body is not None else []
+            for decl in declarations:
+                if isinstance(decl, javalang.tree.ConstructorDeclaration):
+                    constructors.append(decl)
+                elif isinstance(decl, javalang.tree.MethodDeclaration):
+                    methods.append(decl)
+
+        for constructor in constructors:
             params = [JavaMethodParameter(name=param.name, type_descriptor=self._convert_reference(param.type)) for param in constructor.parameters]
             result.append(
                 JavaMethod(
@@ -384,7 +478,7 @@ class JavaSourceParser:
                 )
             )
 
-        for method in getattr(type_decl, "methods", []):
+        for method in methods:
             params = [JavaMethodParameter(name=param.name, type_descriptor=self._convert_reference(param.type)) for param in method.parameters]
             result.append(
                 JavaMethod(
@@ -395,6 +489,32 @@ class JavaSourceParser:
                     is_constructor=False,
                 )
             )
+
+        # javalang may expose the same enum constructors/methods both via top-level
+        # attributes and via EnumDeclaration.body.declarations; de-duplicate.
+        def method_key(m: JavaMethod) -> Tuple[bool, str, Tuple[str, ...], str]:
+            param_types: List[str] = []
+            for p in m.parameters:
+                if p.type_descriptor is None:
+                    param_types.append("")
+                else:
+                    param_types.append(p.type_descriptor.display())
+            rtype = m.return_type.display() if m.return_type is not None else ""
+            return (m.is_constructor, m.name, tuple(param_types), rtype)
+
+        deduped: List[JavaMethod] = []
+        seen: Dict[Tuple[bool, str, Tuple[str, ...], str], JavaMethod] = {}
+        for m in result:
+            key = method_key(m)
+            existing = seen.get(key)
+            if existing is None:
+                seen[key] = m
+                deduped.append(m)
+                continue
+            # Merge modifiers conservatively.
+            existing.modifiers |= m.modifiers
+
+        result = deduped
         if isinstance(type_decl, javalang.tree.InterfaceDeclaration):
             for method in result:
                 if not method.is_constructor and "static" not in method.modifiers and "default" not in method.modifiers:
@@ -538,13 +658,28 @@ class JavaModelBuilder:
             mutable.set_value("stereotype", model.stereotype)
         if model.kind == "enum" and model.enum_constants:
             attributes = mutable.get_value("attributes")
+
+            has_parametrized_ctor = any(m.is_constructor and m.parameters for m in model.methods)
             for const in model.enum_constants:
                 row = attributes.append()
-                row.set_value("name", const)
+                row.set_value("name", const.name)
                 row.set_value("visibility", VISIBILITY_MAP.get("public", "+"))
-        else:
-            self._populate_attributes(mutable, model.fields)
-        self._populate_operations(mutable, model.methods, model.name, is_interface=(model.kind == "interface"))
+                row.set_value("static", True)
+
+                # Only show enum constant initialization in internal view.
+                if self._view == JavaImportView.INTERNAL and has_parametrized_ctor and const.arguments:
+                    row.set_value("default", f"{model.name}({', '.join(const.arguments)})")
+
+        # Enums can also declare fields (often private); include them too.
+        self._populate_attributes(mutable, model.fields)
+        self._populate_operations(
+            mutable,
+            model.methods,
+            model.name,
+            is_interface=(model.kind == "interface"),
+            suppress_constructors=(model.kind == "enum" and self._view == JavaImportView.EXTERNAL),
+            force_constructors_public=(model.kind == "enum" and self._view == JavaImportView.INTERNAL),
+        )
         element.apply_ufl_patch(mutable.make_patch())
         return element
 
@@ -567,9 +702,19 @@ class JavaModelBuilder:
             row.set_value("visibility", field.visibility)
             row.set_value("static", field.is_static)
 
-    def _populate_operations(self, mutable, methods: List[JavaMethod], class_name: str = "", is_interface: bool = False):
+    def _populate_operations(
+        self,
+        mutable,
+        methods: List[JavaMethod],
+        class_name: str = "",
+        is_interface: bool = False,
+        suppress_constructors: bool = False,
+        force_constructors_public: bool = False,
+    ):
         operations = mutable.get_value("operations")
         for method in methods:
+            if suppress_constructors and method.is_constructor:
+                continue
             # In external view, only include public methods and constructors
             # Exception: always include methods for interfaces
             if self._view == JavaImportView.EXTERNAL:
@@ -588,7 +733,10 @@ class JavaModelBuilder:
             else:
                 row.set_value("name", method.name)
                 row.set_value("rtype", method.return_type.display() if method.return_type else "")
-                row.set_value("visibility", method.visibility)
+                if method.is_constructor and force_constructors_public:
+                    row.set_value("visibility", VISIBILITY_MAP.get("public", "+"))
+                else:
+                    row.set_value("visibility", method.visibility)
                 row.set_value("static", method.is_static)
                 row.set_value("abstract", method.is_abstract)
             
